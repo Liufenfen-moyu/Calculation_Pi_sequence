@@ -3,13 +3,28 @@ import argparse
 import numpy as np
 from numba import njit
 
+@njit
+def calculate_X(score_grid):
+    L = score_grid.shape[0]
+    D = 0
+    X = 0.0
+    for i in range(L):
+        row = score_grid[i]
+        allele_counts = row[1:-1]
+        row_sum = 0
+        max_val = 0
+        for val in allele_counts:
+            row_sum += val
+            if val > max_val:
+                max_val = val
+        D = row_sum
+        minor = row_sum - max_val
+        X += minor
+    return X, float(L), float(D)
+
 def make_fastagrid(fasta_path):
-    """
-    将FASTA文件读取为 numpy array，每行为一个序列，每列为一个碱基位置。
-    """
     seqs = []
     current_seq = []
-
     with open(fasta_path) as f:
         for line in f:
             line = line.strip()
@@ -23,135 +38,104 @@ def make_fastagrid(fasta_path):
                 current_seq.append(line)
         if current_seq:
             seqs.append("".join(current_seq).upper())
-
     if len(set(len(s) for s in seqs)) != 1:
         raise ValueError(f"FASTA 文件中序列长度不一致: {fasta_path}")
-
-    # 转换为numpy二维矩阵
-    seq_array = np.array([list(seq) for seq in seqs])
-    return seq_array
-
+    return np.array([list(seq) for seq in seqs])
 
 def score_fastagrid(grid, code):
-    """
-    对每个位点统计各碱基的出现次数，以及除目标碱基以外的字符数。
-    返回结果为 numpy array，每行：[位置, A数, C数, G数, T数, ..., Other数]。
-    """
     score_grid = []
-    for idx, column in enumerate(grid.T, start=1):  # 转置得到列为位点
+    for idx, column in enumerate(grid.T, start=1):
         counts = [idx] + [np.sum(column == base) for base in code]
-        counts.append(len(column) - sum(counts[1:]))  # 统计非指定字符数量
+        counts.append(len(column) - sum(counts[1:]))
         score_grid.append(counts)
     return np.array(score_grid)
 
+def write_score_and_diversity(score_grid, code, output_path, fasta_name, calc_div=False, diversity_output=None):
+    header = "Position\t" + "\t".join(code) + "\tOther"
+    np.savetxt(output_path, score_grid, fmt="%i", delimiter="\t", header=header, comments="")
+    if calc_div:
+        X, L, D = calculate_X(score_grid)
+        pi = X / (((D * (D - 1)) / 2) * L) if D > 1 and L > 0 else 0.0
+        diversity_output.append(f"{fasta_name}\t{int(X)}\t{int(L)}\t{int(D)}\t{pi:.6f}")
 
-@njit
-def calculate_X(score_grid):
-    """
-    使用 Numba 加速的多样性统计量计算函数。
-    score_grid: numpy 2D array，每行：[位置, A数, C数, G数, T数, ..., Other数]
-    返回值：
-    - X: 所有位点的 minor allele 次数之和
-    - L: 比对长度（即位点数）
-    - D: 序列数（= 每个位点的计数和）
-    """
-    L = score_grid.shape[0]
-    D = 0
-    X = 0.0
-
-    for i in range(L):
-        row = score_grid[i]
-        allele_counts = row[1:-1]  # 去除位置与Other列
-        row_sum = 0
-        max_val = 0
-        for val in allele_counts:
-            row_sum += val
-            if val > max_val:
-                max_val = val
-        D = row_sum  # 假设每个位点都有相同的序列数
-        minor = row_sum - max_val
-        X += minor
-
-    return X, float(L), float(D)
-
-
-def run_all(options):
-    fastadir = options.fastadir
-    outdir = options.outdir
-    code = list(options.code.upper())
-    gapcode = options.gapcode
-    code_with_gap = code + [gapcode]
-    calculate_div = options.div
-    divout_file = options.divout
-
-    print(f"输入FASTA目录: {fastadir}")
-    print(f"输出目录: {outdir}")
-    print(f"计数字符: {code}（含gap符号: {gapcode}）")
-    print(f"是否计算多样性: {calculate_div}")
-
-    if not os.path.isdir(fastadir):
-        raise FileNotFoundError(f"找不到FASTA目录: {fastadir}")
-
-    fasta_files = [f for f in os.listdir(fastadir) if f.lower().endswith(('.fa', '.fasta'))]
-    if not fasta_files:
-        raise FileNotFoundError("FASTA目录中未找到.fasta或.fa文件")
-
+def run_gene_model(args, code_with_gap):
+    fasta_dir = args.fasta
+    outdir = args.outdir
     os.makedirs(outdir, exist_ok=True)
-
-    diversity_output = []
-    if calculate_div:
-        diversity_output.append("File\tX\tLength\tDepth\tPi")
-
+    diversity_output = ["File\tX\tLength\tDepth\tPi"] if args.div else []
+    fasta_files = [f for f in os.listdir(fasta_dir) if f.lower().endswith(('.fa', '.fasta', 'fas'))]
+    if not fasta_files:
+        raise FileNotFoundError("未找到FASTA文件")
     for fasta in fasta_files:
-        fasta_path = os.path.join(fastadir, fasta)
+        fasta_path = os.path.join(fasta_dir, fasta)
         try:
             grid = make_fastagrid(fasta_path)
+            score_grid = score_fastagrid(grid, code_with_gap)
+            out_file = os.path.join(outdir, f"{fasta}.txt")
+            write_score_and_diversity(score_grid, code_with_gap, out_file, fasta, args.div, diversity_output)
         except Exception as e:
-            print(f"[跳过] 读取失败 {fasta_path}：{e}")
-            continue
-
-        score_grid = score_fastagrid(grid, code_with_gap)
-
-        # 保存位点频率表
-        out_path = os.path.join(outdir, f"{fasta}.txt")
-        header = "Position\t" + "\t".join(code_with_gap) + "\tOther"
-        np.savetxt(out_path, score_grid, fmt="%i", delimiter="\t", header=header, comments="")
-
-        # 多样性计算
-        if calculate_div:
-            try:
-                X, L, D = calculate_X(score_grid)
-                pi = X / (((D * (D - 1)) / 2) * L) if D > 1 and L > 0 else 0.0
-                diversity_output.append(f"{fasta}\t{int(X)}\t{int(L)}\t{int(D)}\t{pi:.6f}")
-            except Exception as e:
-                print(f"[警告] 多样性计算失败: {fasta}: {e}")
-
-    # 输出多样性文件
-    if calculate_div:
-        with open(divout_file, "w") as f:
+            print(f"[跳过] 文件 {fasta}: {e}")
+    if args.div:
+        with open(args.divout, "w") as f:
             f.write("\n".join(diversity_output))
-        print(f"多样性输出写入: {divout_file}")
+        print(f"多样性输出：{args.divout}")
 
+def run_window_model(args, code_with_gap):
+    fasta_file = args.fasta
+    outdir = args.outdir
+    win_size = args.size
+    os.makedirs(outdir, exist_ok=True)
+    grid = make_fastagrid(fasta_file)
+    n_seqs, seq_len = grid.shape
+    diversity_output = ["File\tX\tLength\tDepth\tPi"] if args.div else []
+    fasta_name = os.path.basename(fasta_file)
+
+    # 滑窗切片
+    for start in range(0, seq_len, win_size):
+        end = min(start + win_size, seq_len)
+        if end - start < 2:
+            continue
+        window_grid = grid[:, start:end]
+        score_grid = score_fastagrid(window_grid, code_with_gap)
+        window_name = f"{fasta_name}_win_{start+1}_{end}"
+        out_file = os.path.join(outdir, f"{window_name}.txt")
+        write_score_and_diversity(score_grid, code_with_gap, out_file, window_name, args.div, diversity_output)
+
+    if args.div:
+        with open(args.divout, "w") as f:
+            f.write("\n".join(diversity_output))
+        print(f"多样性输出：{args.divout}")
 
 def main():
-    parser = argparse.ArgumentParser(description="统计FASTA文件中每个位点的碱基频率，并可选计算碱基多样性指标。")
-    parser.add_argument("-f", "--fastadir", required=True,
-                        help="包含FASTA文件的输入目录")
+    parser = argparse.ArgumentParser(description="FASTA 位点频率与多样性计算工具，支持 gene 与 window 模式")
+    parser.add_argument("-f", "--fasta", required=True,
+                        help="输入FASTA文件或目录路径")
     parser.add_argument("-o", "--outdir", default="out",
-                        help="输出目录，默认为 ./out")
+                        help="输出目录 [默认: ./out]")
     parser.add_argument("-c", "--code", default="ACGT",
-                        help="统计的碱基代码，默认为 'ACGT'")
+                        help="计数的碱基字符，默认: ACGT")
     parser.add_argument("-g", "--gapcode", default="-",
-                        help="表示gap的字符，默认 '-'")
+                        help="gap字符，默认: '-'")
     parser.add_argument("-d", "--div", action="store_true",
-                        help="是否计算碱基多样性 Pi 值")
+                        help="是否计算多样性 Pi 值")
     parser.add_argument("-t", "--divout", default="diversity.tsv",
-                        help="输出的多样性文件路径，仅在指定 -d 时有效")
+                        help="多样性输出文件路径")
+    parser.add_argument("-m", "--model", choices=["gene", "window"], default="gene",
+                        help="运行模式：gene（目录模式）或 window（单文件滑窗）")
+    parser.add_argument("-s", "--size", type=int, default=500,
+                        help="滑窗大小，仅 window 模式生效，默认: 500")
 
     args = parser.parse_args()
-    run_all(args)
+    code_with_gap = list(args.code.upper()) + [args.gapcode]
 
+    if args.model == "gene":
+        if not os.path.isdir(args.fasta):
+            raise ValueError("gene 模式下输入必须为目录")
+        run_gene_model(args, code_with_gap)
+    elif args.model == "window":
+        if not os.path.isfile(args.fasta):
+            raise ValueError("window 模式下输入必须为单个FASTA文件")
+        run_window_model(args, code_with_gap)
 
 if __name__ == "__main__":
     main()
-
